@@ -21,10 +21,27 @@ pi --plan "add a notifications system"     # optional: seeds the first turn
    │             the request — interpretation, options, implications, impact,
    │             and the decisions you need to make. Commits are recorded.
    │
-   └─ emit_plan  (agent tool) → schema + Ralph-checklist validated
-                 → writes tasks/prd-<branch>.md   ← human review gate (always)
-                 → on approval writes ./prd.json   ← the handoff for ralph.sh
+   ├─ emit_plan  (agent tool) → schema + Ralph-checklist validated
+   │             → writes tasks/prd-<branch>.md   ← human review artifact
+   │
+   └─ /compile-prd <branch>   (user command) → re-validates the reviewed
+                 (optionally hand-edited) markdown and writes ./prd.json
+                 ← the handoff for ralph.sh
 ```
+
+## `/compile-prd` — markdown → prd.json
+
+The agent never writes `prd.json` directly. `emit_plan` only produces the human-readable
+`tasks/prd-<branch>.md`. You review it (and edit it by hand if you like), then run the
+command yourself to compile it into the executor handoff:
+
+- `/compile-prd <branch>` — compile `tasks/prd-<branch>.md` → `prd.json`
+- `/compile-prd path/to/prd-foo.md` — compile a specific file
+- `/compile-prd` — pick from the `tasks/prd-*.md` files found
+
+The command re-parses the markdown, re-runs schema + Ralph-checklist validation, asks for
+confirmation, then writes `prd.json`. Because it parses the file on disk, any manual edits
+you make to the PRD are picked up.
 
 ## Why a flag, not a toggle
 
@@ -49,8 +66,8 @@ resumed planning session keeps its grounding.
 
 - **Read-only**: `write`/`edit` are blocked; bash is allowlisted to read-only commands.
 - **Exploration required**: `emit_plan` is blocked until at least one decision is recorded.
-- **Human review always**: `emit_plan` writes `tasks/prd-<branch>.md` and waits for your
-  approval before writing `prd.json`.
+- **Human review always**: `emit_plan` only writes `tasks/prd-<branch>.md`. `prd.json` is
+  written exclusively by the `/compile-prd` command after you review the markdown.
 - **Schema + checklist validation**: every story must include `Typecheck passes`,
   `branchName` must be `ralph/...`, dependency ordering and story sizing are enforced/warned.
 
@@ -80,7 +97,7 @@ pi -e ./plan-execute-mode/index.ts --plan "your feature"
 
 | File | Role |
 |------|------|
-| `index.ts` | Flag, persona, read-only gating, `/explore`, `record_decision`, `emit_plan`, review gate |
+| `index.ts` | Flag, persona, read-only gating, `/explore`, `record_decision`, `emit_plan`, `/compile-prd` |
 | `prompts.ts` | Planner persona + explore kickoff instruction |
-| `schema.ts` | `prd.json` typebox schema + Ralph-checklist validation |
+| `schema.ts` | `prd.json` typebox schema, Ralph-checklist validation, markdown↔plan parse |
 | `bash-allowlist.ts` | Read-only bash gating |

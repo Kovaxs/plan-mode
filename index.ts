@@ -23,7 +23,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { isSafeCommand } from "./bash-allowlist.ts";
 import { exploreKickoff, PLANNER_PERSONA } from "./prompts.ts";
-import { type Prd, PrdSchema, toPrdJson, validatePlan } from "./schema.ts";
+import { type Prd, parsePrdMarkdown, PrdSchema, toPrdJson, validatePlan } from "./schema.ts";
 
 // Where artifacts land. Adjust to match your ralph.sh location if needed.
 const PRD_JSON_PATH = "prd.json";
@@ -163,12 +163,12 @@ export default function planMode(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── tool: emit_plan (gated by exploration + human review) ───────────────────
+	// ── tool: emit_plan (writes the human-reviewable PRD.md only) ────────────────
 	pi.registerTool({
 		name: "emit_plan",
 		label: "Emit Plan",
 		description:
-			"Emit the final Ralph-format plan. Only call after exploration has recorded decisions. Writes a human-reviewable PRD.md, then prd.json after the human approves.",
+			"Emit the final Ralph-format plan as a human-reviewable tasks/prd-<branch>.md. Only call after exploration has recorded decisions. Does NOT write prd.json — the human compiles it with the /compile-prd command after reviewing.",
 		parameters: PrdSchema,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const plan = params as Prd;
@@ -193,41 +193,89 @@ export default function planMode(pi: ExtensionAPI): void {
 				};
 			}
 
-			if (!ctx.hasUI) {
-				return {
-					content: [{ type: "text", text: "emit_plan requires interactive mode for the human review gate." }],
-					isError: true,
-				};
-			}
-
-			// Write the human-readable PRD first (review gate input).
+			// Write the human-readable PRD. The human reviews it, then runs /compile-prd.
 			const mdPath = prdMdPath(plan.branchName);
 			await fs.mkdir(path.dirname(path.resolve(ctx.cwd, mdPath)), { recursive: true });
 			await fs.writeFile(path.resolve(ctx.cwd, mdPath), renderPrdMarkdown(plan, decisions, warnings), "utf8");
 
 			const warnLine = warnings.length ? `\n⚠ ${warnings.length} warning(s) — see ${mdPath}` : "";
-			const choice = await ctx.ui.select(
-				`Plan written to ${mdPath}. Review it, then:`,
-				["✓ Approve — write prd.json", "✗ Reject — revise"],
-			);
-
-			if (!choice?.startsWith("✓")) {
-				return {
-					content: [{ type: "text", text: `Human rejected the plan. Revise and emit again. (${mdPath} kept for reference.)` }],
-					isError: true,
-				};
-			}
-
-			await fs.writeFile(path.resolve(ctx.cwd, PRD_JSON_PATH), toPrdJson(plan), "utf8");
+			const branch = plan.branchName.replace(/^ralph\//, "");
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Plan approved.\n- ${mdPath} (human PRD)\n- ${PRD_JSON_PATH} (executor handoff)${warnLine}\nReady for the executor (ralph.sh).`,
+						text: `PRD written to ${mdPath}.${warnLine}\nReview it, edit by hand if needed, then run \`/compile-prd ${branch}\` to produce ${PRD_JSON_PATH} for the executor (ralph.sh).`,
 					},
 				],
-				details: { stories: plan.userStories.length, warnings },
+				details: { stories: plan.userStories.length, warnings, mdPath },
 			};
+		},
+	});
+
+	// ── /compile-prd : transform tasks/prd-<branch>.md → prd.json ────────────────
+	pi.registerCommand("compile-prd", {
+		description: "Compile a reviewed tasks/prd-<branch>.md into prd.json for the executor",
+		handler: async (args, ctx) => {
+			const arg = args.trim();
+			let mdPath: string;
+
+			if (arg) {
+				// Accept a branch name, a bare prd-*.md filename, or a path.
+				mdPath = arg.includes("/") || arg.endsWith(".md") ? arg : prdMdPath(arg);
+			} else {
+				const tasksDir = path.resolve(ctx.cwd, "tasks");
+				const found = await fs
+					.readdir(tasksDir)
+					.then((files) => files.filter((f) => /^prd-.+\.md$/.test(f)))
+					.catch(() => [] as string[]);
+				if (found.length === 0) {
+					ctx.ui.notify("No tasks/prd-*.md files found. Emit or write a PRD first.", "error");
+					return;
+				}
+				const picked = found.length === 1 ? found[0] : await ctx.ui.select("Which PRD do you want to compile?", found);
+				if (!picked) return;
+				mdPath = path.join("tasks", picked);
+			}
+
+			const absMd = path.resolve(ctx.cwd, mdPath);
+			let md: string;
+			try {
+				md = await fs.readFile(absMd, "utf8");
+			} catch {
+				ctx.ui.notify(`Could not read ${mdPath}.`, "error");
+				return;
+			}
+
+			const plan = parsePrdMarkdown(md);
+			if (!plan.branchName) {
+				ctx.ui.notify(`Could not parse a branch name from ${mdPath}. Is it a valid PRD?`, "error");
+				return;
+			}
+
+			const { errors, warnings } = validatePlan(plan);
+			if (errors.length > 0) {
+				ctx.ui.notify(`Plan rejected by validation:\n- ${errors.join("\n- ")}`, "error");
+				return;
+			}
+
+			if (ctx.hasUI) {
+				const warnLine = warnings.length ? ` (${warnings.length} warning(s))` : "";
+				const choice = await ctx.ui.select(
+					`Compile ${mdPath} → ${PRD_JSON_PATH}? ${plan.userStories.length} story(ies)${warnLine}`,
+					["✓ Write prd.json", "✗ Cancel"],
+				);
+				if (!choice?.startsWith("✓")) {
+					ctx.ui.notify("Cancelled. prd.json not written.", "info");
+					return;
+				}
+			}
+
+			await fs.writeFile(path.resolve(ctx.cwd, PRD_JSON_PATH), toPrdJson(plan), "utf8");
+			const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
+			ctx.ui.notify(
+				`Wrote ${PRD_JSON_PATH} from ${mdPath} (${plan.userStories.length} stories).${warnNote}`,
+				warnings.length ? "warning" : "success",
+			);
 		},
 	});
 

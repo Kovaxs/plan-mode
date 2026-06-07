@@ -101,3 +101,39 @@ export function toPrdJson(plan: Prd): string {
 	const ordered = [...plan.userStories].sort((a, b) => a.priority - b.priority);
 	return `${JSON.stringify({ ...plan, userStories: ordered }, null, 2)}\n`;
 }
+
+/**
+ * Parse a human-reviewed `tasks/prd-<branch>.md` back into a Prd.
+ *
+ * This is the inverse of `renderPrdMarkdown` in index.ts. The markdown does not
+ * carry priority / passes / notes, so we reconstruct them: priority follows the
+ * (dependency-ordered) document order, passes is always false, notes is empty.
+ */
+export function parsePrdMarkdown(md: string): Prd {
+	const project = (md.match(/^#\s+PRD:\s*(.+)$/m)?.[1] ?? "").trim();
+	const branchName = (md.match(/\*\*Branch:\*\*\s*`([^`]+)`/)?.[1] ?? "").trim();
+
+	// Description: everything between the Branch line and the first "## " heading.
+	const afterBranch = md.split(/\*\*Branch:\*\*\s*`[^`]+`/)[1] ?? "";
+	const description = afterBranch.split(/\n##\s/)[0].trim();
+
+	// User Stories section: between "## User Stories" and the next "## " or the trailing "---".
+	const storiesSection = md.split(/##\s+User Stories\s*\n/)[1] ?? "";
+	const storiesBody = storiesSection.split(/\n##\s/)[0].split(/\n---/)[0];
+
+	const userStories: UserStory[] = `\n${storiesBody}`
+		.split(/\n###\s+/)
+		.slice(1)
+		.map((block, idx): UserStory => {
+			const header = block.match(/^([^\n:]+):\s*(.+)/);
+			const id = header ? header[1].trim() : `US-${String(idx + 1).padStart(3, "0")}`;
+			const title = header ? header[2].trim() : "";
+			const description = block.match(/\*\*Description:\*\*\s*(.+)/)?.[1]?.trim() ?? "";
+			const acIndex = block.indexOf("**Acceptance Criteria:**");
+			const acBlock = acIndex >= 0 ? block.slice(acIndex) : "";
+			const acceptanceCriteria = [...acBlock.matchAll(/^\s*-\s*\[[ xX]?\]\s+(.+)$/gm)].map((m) => m[1].trim());
+			return { id, title, description, acceptanceCriteria, priority: idx + 1, passes: false, notes: "" };
+		});
+
+	return { project, branchName, description, userStories };
+}

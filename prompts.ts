@@ -46,8 +46,10 @@ Ralph-format plan and call \`emit_plan\`. Follow these rules strictly:
 - **branchName**: kebab-case, prefixed with "ralph/".
 - Every story starts with passes:false and empty notes.
 
-After \`emit_plan\` succeeds, a human review gate runs. If the human rejects, revise and
-emit again.`;
+\`emit_plan\` writes a human-reviewable \`tasks/prd-<branch>.md\` only. It does NOT write
+\`prd.json\`. After it succeeds, tell the user to review (and optionally hand-edit) the
+markdown, then run the \`/compile-prd <branch>\` command themselves to produce the
+\`prd.json\` handoff. If they want changes you can make, revise and call \`emit_plan\` again.`;
 
 export function exploreKickoff(focus: string): string {
 	const scope = focus

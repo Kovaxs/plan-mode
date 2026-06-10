@@ -8,11 +8,13 @@
  * Flow:
  *   pi --plan "add notifications"
  *     -> planner persona, read-only tools
- *     -> /explore     interactive advisory loop (agent helps the USER understand
- *                     options/implications/changes; decisions are recorded)
+ *     -> chat: agent clarifies decision points interactively (ask_decision picker)
+ *              and records every commitment (record_decision); /explore is an
+ *              OPTIONAL structured-briefing helper, never a prerequisite
  *     -> agent drafts the PRD as markdown in chat (no file writes)
  *     -> /emit-plan   USER command: validates the draft against the full
- *                     Ralph checklist (same conditions as compiling) and
+ *                     Ralph checklist; on failure the errors are bounced back
+ *                     to the planner so it corrects the draft; on success it
  *                     writes tasks/prd-<branch>.md (human review gate, always)
  *     -> /compile-prd USER command: tasks/prd-<branch>.md -> ./prd.json
  *
@@ -38,7 +40,9 @@ import {
 const PRD_JSON_PATH = "prd.json";
 const prdMdPath = (branch: string) => path.join("tasks", `prd-${branch.replace(/^ralph\//, "")}.md`);
 
-const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash"];
+// NOTE: must include this extension's own tools — setActiveTools() deactivates
+// anything not listed, including extension-registered tools.
+const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "record_decision", "ask_decision"];
 
 export default function planMode(pi: ExtensionAPI): void {
 	let planEnabled = false;
@@ -62,11 +66,11 @@ export default function planMode(pi: ExtensionAPI): void {
 			"plan",
 			ready
 				? ctx.ui.theme.fg("success", `📋 planner · ${decisions.length} decision(s)`)
-				: ctx.ui.theme.fg("warning", "📋 planner · explore first"),
+				: ctx.ui.theme.fg("muted", "📋 planner"),
 		);
 		const lines =
 			decisions.length === 0
-				? [ctx.ui.theme.fg("dim", "No decisions yet — run /explore")]
+				? [ctx.ui.theme.fg("dim", "No decisions yet — they are recorded as you chat (/explore is optional)")]
 				: decisions.map((d, i) => `${ctx.ui.theme.fg("accent", `${i + 1}.`)} ${d.question} → ${ctx.ui.theme.fg("muted", d.decision)}`);
 		ctx.ui.setWidget("plan-decisions", lines);
 	}
@@ -110,7 +114,7 @@ export default function planMode(pi: ExtensionAPI): void {
 		refreshUi(ctx);
 		if (decisions.length === 0) {
 			ctx.ui.notify(
-				"📋 Planner mode (read-only). Describe your feature to start exploring — or use /explore for a focused round.",
+				"📋 Planner mode (read-only). Describe your feature — decisions are recorded as you chat. /explore is an optional deep-dive. Emit the PRD with /emit-plan.",
 				"info",
 			);
 		}
@@ -136,9 +140,9 @@ export default function planMode(pi: ExtensionAPI): void {
 		return { systemPrompt: `${event.systemPrompt}\n\n${PLANNER_PERSONA}` };
 	});
 
-	// ── /explore : interactive advisory loop ────────────────────────────────────
+	// ── /explore : OPTIONAL interactive advisory loop ───────────────────────────
 	pi.registerCommand("explore", {
-		description: "Interactively explore the request — options, implications, impact (read-only)",
+		description: "Optional: explore the request in depth — options, implications, impact (read-only)",
 		handler: async (args, ctx) => {
 			if (!planEnabled) {
 				ctx.ui.notify("Explore is only available in planner mode (pi --plan).", "error");
@@ -153,7 +157,7 @@ export default function planMode(pi: ExtensionAPI): void {
 		description: "Show decisions recorded during exploration",
 		handler: async (_args, ctx) => {
 			if (decisions.length === 0) {
-				ctx.ui.notify("No decisions recorded yet. Run /explore.", "info");
+				ctx.ui.notify("No decisions recorded yet. They are recorded automatically as you resolve questions in chat.", "info");
 				return;
 			}
 			const list = decisions
@@ -163,12 +167,58 @@ export default function planMode(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── tool: record_decision (called by the agent during exploration) ──────────
+	// ── tool: ask_decision (interactive picker — presents options, records pick) ─
+	pi.registerTool({
+		name: "ask_decision",
+		label: "Ask Decision",
+		description:
+			"Present a decision point to the user as an interactive picker. The user's choice is recorded as a decision automatically. Use this whenever the user must choose between concrete options.",
+		parameters: Type.Object({
+			question: Type.String({ description: "The decision point / question being resolved" }),
+			options: Type.Array(Type.String(), {
+				description: "2-5 concrete options the user can pick from (a free-text 'Other' is added automatically)",
+			}),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "No interactive UI available. Ask the question in chat instead, then record the answer with record_decision.",
+						},
+					],
+				};
+			}
+			const OTHER = "✎ Other (type an answer)";
+			const choice = await ctx.ui.select(params.question, [...params.options, OTHER]);
+			if (choice === undefined) {
+				return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
+			}
+			let answer = choice;
+			if (choice === OTHER) {
+				const typed = await ctx.ui.input(params.question, "your answer");
+				if (!typed?.trim()) {
+					return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
+				}
+				answer = typed.trim();
+			}
+			decisions.push({ question: params.question, decision: answer });
+			persist();
+			refreshUi(ctx);
+			return {
+				content: [{ type: "text", text: `User decided: ${params.question} → ${answer} (recorded)` }],
+				details: { decisionCount: decisions.length },
+			};
+		},
+	});
+
+	// ── tool: record_decision (free-form commitments made in chat) ──────────────
 	pi.registerTool({
 		name: "record_decision",
 		label: "Record Decision",
 		description:
-			"Record a decision the user committed to during exploration. Call this whenever the user resolves an option or scope question.",
+			"Record a decision the user committed to in chat. Call this immediately whenever the user resolves an option, scope, or direction question — on every interaction where a decision is made.",
 		parameters: Type.Object({
 			question: Type.String({ description: "The decision point / question being resolved" }),
 			decision: Type.String({ description: "What the user decided" }),
@@ -193,10 +243,6 @@ export default function planMode(pi: ExtensionAPI): void {
 				ctx.ui.notify("/emit-plan is only available in planner mode (pi --plan).", "error");
 				return;
 			}
-			if (decisions.length === 0) {
-				ctx.ui.notify("Blocked: no decisions recorded. Run an /explore round and record decisions first.", "error");
-				return;
-			}
 
 			const draft = findDraftedPrd(ctx);
 			if (!draft) {
@@ -209,16 +255,23 @@ export default function planMode(pi: ExtensionAPI): void {
 
 			const plan = parsePrdMarkdown(draft);
 			if (!plan.branchName) {
-				ctx.ui.notify("Drafted PRD has no parseable **Branch:** line. Ask the planner to redraft it.", "error");
+				ctx.ui.notify("Drafted PRD has no parseable **Branch:** line — asking the planner to correct it.", "warning");
+				pi.sendUserMessage(
+					"[EMIT-PLAN FAILED] The drafted PRD has no parseable **Branch:** `ralph/<kebab-case>` line. Redraft the full corrected PRD as a single fenced markdown block, then I will run /emit-plan again.",
+				);
 				return;
 			}
 
 			// The plan must meet ALL compiling conditions before it can be emitted.
+			// On failure, bounce the errors back to the planner so it corrects the draft.
 			const { errors, warnings } = validatePlan(plan);
 			if (errors.length > 0) {
 				ctx.ui.notify(
-					`Plan does not meet compile conditions — not emitted:\n- ${errors.join("\n- ")}\nAsk the planner to fix the draft, then run /emit-plan again.`,
-					"error",
+					`Draft fails compile conditions — asking the planner to correct it:\n- ${errors.join("\n- ")}`,
+					"warning",
+				);
+				pi.sendUserMessage(
+					`[EMIT-PLAN FAILED] The drafted PRD does not meet the compile conditions:\n- ${errors.join("\n- ")}\n\nFix these issues and redraft the FULL corrected PRD as a single fenced markdown block, then I will run /emit-plan again.`,
 				);
 				return;
 			}

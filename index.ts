@@ -11,11 +11,13 @@
  *     -> chat: agent clarifies decision points interactively (ask_decision picker)
  *              and records every commitment (record_decision); /explore is an
  *              OPTIONAL structured-briefing helper, never a prerequisite
- *     -> agent drafts the PRD as markdown in chat (no file writes)
- *     -> /emit-plan   USER command: validates the draft against the full
- *                     Ralph checklist; on failure the errors are bounced back
- *                     to the planner so it corrects the draft; on success it
- *                     writes tasks/prd-<branch>.md (human review gate, always)
+ *     -> /emit-plan   USER command, runnable at any time: generates the PRD from
+ *                     the chat history. If no draft exists yet, the planner is
+ *                     asked to draft one from the conversation; the draft is
+ *                     validated against the full Ralph checklist (errors are
+ *                     bounced back for correction, bounded retries) and on
+ *                     success tasks/prd-<branch>.md is written (human review
+ *                     gate, always)
  *     -> /compile-prd USER command: tasks/prd-<branch>.md -> ./prd.json
  *
  * The executor (ralph.sh) is never touched. The only shared contract is prd.json.
@@ -235,60 +237,100 @@ export default function planMode(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── /emit-plan : USER command — validate drafted PRD, write tasks/prd-<branch>.md ──
+	// ── /emit-plan : generate the PRD from the chat history → tasks/prd-<branch>.md ─
+	// A pre-existing draft is NOT required: if none is found, the planner is asked
+	// to draft one from the conversation, and the emit auto-finishes on agent_end.
+	const EMIT_ATTEMPTS = 2; // auto-retries after asking the planner to draft/fix
+	let pendingEmit = 0;
+
+	const draftRequest = () =>
+		"[EMIT-PLAN] Draft the PRD now from our conversation so far. Convert everything discussed and decided into the Ralph-format PRD, following the exact fenced markdown template and the compile checklist in your instructions. Reply with ONE fenced ```markdown block.";
+
+	const fixRequest = (errors: string[]) =>
+		`[EMIT-PLAN FAILED] The drafted PRD does not meet the compile conditions:\n- ${errors.join("\n- ")}\n\nFix these issues and redraft the FULL corrected PRD as a single fenced markdown block.`;
+
+	/**
+	 * Attempt one emit pass: find the latest draft in chat, validate it against the
+	 * compile conditions, and write tasks/prd-<branch>.md.
+	 * On validation failure the errors are bounced back to the planner.
+	 */
+	async function tryEmitPlan(ctx: ExtensionContext): Promise<"written" | "bounced" | "no-draft"> {
+		const draft = findDraftedPrd(ctx);
+		if (!draft) return "no-draft";
+
+		const plan = parsePrdMarkdown(draft);
+		const { errors, warnings } = plan.branchName
+			? validatePlan(plan)
+			: { errors: ["missing a parseable **Branch:** `ralph/<kebab-case>` line"], warnings: [] as string[] };
+
+		if (errors.length > 0) {
+			ctx.ui.notify(
+				`Draft fails compile conditions — asking the planner to correct it:\n- ${errors.join("\n- ")}`,
+				"warning",
+			);
+			pi.sendUserMessage(fixRequest(errors));
+			return "bounced";
+		}
+
+		// Write the human-readable PRD. The human reviews it, then runs /compile-prd.
+		const mdPath = prdMdPath(plan.branchName);
+		const absMd = path.resolve(ctx.cwd, mdPath);
+		await fs.mkdir(path.dirname(absMd), { recursive: true });
+		await fs.writeFile(absMd, renderPrdMarkdown(plan, decisions, warnings), "utf8");
+
+		const branch = plan.branchName.replace(/^ralph\//, "");
+		const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
+		ctx.ui.notify(
+			`PRD written to ${mdPath} (${plan.userStories.length} stories).${warnNote}\nReview it, edit by hand if needed, then run /compile-prd ${branch} to produce ${PRD_JSON_PATH}.`,
+			warnings.length ? "warning" : "info",
+		);
+		return "written";
+	}
+
 	pi.registerCommand("emit-plan", {
-		description: "Validate the PRD the planner drafted in chat and write tasks/prd-<branch>.md",
+		description: "Generate the PRD from the chat (drafting it if needed), validate, and write tasks/prd-<branch>.md",
 		handler: async (_args, ctx) => {
 			if (!planEnabled) {
 				ctx.ui.notify("/emit-plan is only available in planner mode (pi --plan).", "error");
 				return;
 			}
+			const result = await tryEmitPlan(ctx);
+			if (result === "no-draft") {
+				pendingEmit = EMIT_ATTEMPTS;
+				ctx.ui.notify("No PRD draft in chat yet — asking the planner to generate one from the conversation…", "info");
+				pi.sendUserMessage(draftRequest());
+			} else if (result === "bounced") {
+				pendingEmit = 1; // auto-finish once the planner posts the corrected draft
+			} else {
+				pendingEmit = 0;
+			}
+		},
+	});
 
-			const draft = findDraftedPrd(ctx);
-			if (!draft) {
+	// Auto-finish a pending /emit-plan once the planner responds.
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!planEnabled || pendingEmit <= 0) return;
+		pendingEmit--;
+		const result = await tryEmitPlan(ctx);
+		if (result === "written") {
+			pendingEmit = 0;
+			return;
+		}
+		if (result === "no-draft") {
+			if (pendingEmit > 0) {
+				pi.sendUserMessage(draftRequest());
+			} else {
 				ctx.ui.notify(
-					"No drafted PRD found in the conversation. Ask the planner to draft the plan (a `# PRD:` markdown block) first.",
+					"Planner did not produce a parseable PRD draft. Ask it to draft the plan, then run /emit-plan again.",
 					"error",
 				);
-				return;
 			}
-
-			const plan = parsePrdMarkdown(draft);
-			if (!plan.branchName) {
-				ctx.ui.notify("Drafted PRD has no parseable **Branch:** line — asking the planner to correct it.", "warning");
-				pi.sendUserMessage(
-					"[EMIT-PLAN FAILED] The drafted PRD has no parseable **Branch:** `ralph/<kebab-case>` line. Redraft the full corrected PRD as a single fenced markdown block, then I will run /emit-plan again.",
-				);
-				return;
-			}
-
-			// The plan must meet ALL compiling conditions before it can be emitted.
-			// On failure, bounce the errors back to the planner so it corrects the draft.
-			const { errors, warnings } = validatePlan(plan);
-			if (errors.length > 0) {
-				ctx.ui.notify(
-					`Draft fails compile conditions — asking the planner to correct it:\n- ${errors.join("\n- ")}`,
-					"warning",
-				);
-				pi.sendUserMessage(
-					`[EMIT-PLAN FAILED] The drafted PRD does not meet the compile conditions:\n- ${errors.join("\n- ")}\n\nFix these issues and redraft the FULL corrected PRD as a single fenced markdown block, then I will run /emit-plan again.`,
-				);
-				return;
-			}
-
-			// Write the human-readable PRD. The human reviews it, then runs /compile-prd.
-			const mdPath = prdMdPath(plan.branchName);
-			const absMd = path.resolve(ctx.cwd, mdPath);
-			await fs.mkdir(path.dirname(absMd), { recursive: true });
-			await fs.writeFile(absMd, renderPrdMarkdown(plan, decisions, warnings), "utf8");
-
-			const branch = plan.branchName.replace(/^ralph\//, "");
-			const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
-			ctx.ui.notify(
-				`PRD written to ${mdPath} (${plan.userStories.length} stories).${warnNote}\nReview it, edit by hand if needed, then run /compile-prd ${branch} to produce ${PRD_JSON_PATH}.`,
-				warnings.length ? "warning" : "info",
-			);
-		},
+			return;
+		}
+		// bounced: the fix request is already queued by tryEmitPlan
+		if (pendingEmit <= 0) {
+			ctx.ui.notify("Auto-retry limit reached. When the planner posts the corrected draft, run /emit-plan again.", "warning");
+		}
 	});
 
 	// ── /compile-prd : transform tasks/prd-<branch>.md → prd.json ────────────────

@@ -11,7 +11,7 @@ pi --plan                                    # enter planner, then just chat
 pi --plan "add a notifications system"       # optional: seed the first turn
 ```
 
-From there you describe your feature, the agent clarifies the decision points interactively (and records every decision as you chat), then drafts a PRD in chat. You emit it with `/emit-plan` (validated against the full compile checklist — if validation fails, the errors are bounced back to the planner so it corrects the draft), review the markdown, then compile it into the executor handoff with `/compile-prd`.
+From there you describe your feature, the agent clarifies the decision points interactively (and records every decision as you chat). Run `/emit-plan` **at any time**: it generates the PRD from the chat history — if no draft exists yet the planner drafts one from the conversation, it is validated against the full compile checklist (failures are bounced back to the planner for correction), and `tasks/prd-<branch>.md` is written. Review the markdown, then compile it into the executor handoff with `/compile-prd`.
 
 One chat session produces one PRD — a bunch of small, ordered user stories. `/explore` is an **optional** deep-dive helper, never a prerequisite.
 
@@ -40,16 +40,14 @@ User describes feature
       Implications, Impact, Decisions needed
         │
         ▼
-  Agent drafts PRD as fenced ```markdown block in chat (cannot write files),
-  self-checking it against the compile conditions first
-        │
-        ▼
-  ┌─ /emit-plan ─┐  USER command (not the agent)
-  │  find draft   │  → scans assistant messages for # PRD: block
+  ┌─ /emit-plan ─┐  USER command (not the agent) — runnable at ANY time
+  │  find draft   │  → scans assistant messages for # PRD: block;
+  │               │    if none exists, asks the planner to DRAFT it from the
+  │               │    chat history and auto-resumes when it responds
   │  parse +      │  → parsePrdMarkdown() → Prd
   │  validate     │  → validatePlan() — must pass ALL compile conditions;
   │               │    on failure, errors are sent back to the planner,
-  │               │    it redrafts, you run /emit-plan again
+  │               │    it redrafts, the emit auto-retries (bounded)
   │  write        │  → tasks/prd-<branch>.md  (human review gate)
   └───────────────┘
         │
@@ -109,16 +107,17 @@ Once decisions are recorded, you ask the agent to draft the plan. The agent conv
 
 Story order = priority order. Every story must include "Typecheck passes". UI stories must include "Verify in browser using dev-browser skill". The planner is read-only — **it cannot write files**.
 
-### Phase 3 — Emit the PRD (user command)
+### Phase 3 — Emit the PRD (user command, any time)
 
-Emitting is an **explicit user command**, not something the agent does:
+Emitting is an **explicit user command**, not something the agent does. A pre-existing draft is **not required** — `/emit-plan` generates the PRD from whatever is in the chat history:
 
 **`/emit-plan`** —
 
 1. Scans the conversation for the most recent assistant message containing a `# PRD:` markdown block.
-2. Parses it into a structured `Prd` via `parsePrdMarkdown()`.
-3. Runs `validatePlan()` — the **exact same Ralph checklist that `/compile-prd` enforces**. If any compile condition fails (missing `ralph/` prefix, no stories, duplicate IDs, missing "Typecheck passes", `passes !== false`, etc.), nothing is written and the **error list is sent back to the planner**, which redrafts a corrected PRD — then you run `/emit-plan` again.
-4. On success, renders and writes `tasks/prd-<branch>.md` — a normalized markdown document including project metadata, recorded decisions, ordered user stories, and any validation warnings.
+2. **If none exists**, asks the planner to draft the PRD from the conversation so far (an `[EMIT-PLAN]` message). When the planner responds, the emit resumes automatically (`agent_end` hook, bounded retries).
+3. Parses the draft into a structured `Prd` via `parsePrdMarkdown()`.
+4. Runs `validatePlan()` — the **exact same Ralph checklist that `/compile-prd` enforces**. If any compile condition fails (missing `ralph/` prefix, no stories, duplicate IDs, missing "Typecheck passes", `passes !== false`, etc.), nothing is written and the **error list is sent back to the planner**, which redrafts — the emit then auto-retries.
+5. On success, renders and writes `tasks/prd-<branch>.md` — a normalized markdown document including project metadata, recorded decisions, ordered user stories, and any validation warnings.
 
 If you want changes, ask the agent to revise the draft, then run `/emit-plan` again. No decisions are required to emit — if none were recorded, the Decisions section simply reads `_none_`.
 
@@ -179,6 +178,7 @@ Priority follows dependency order: schema/migrations → backend logic → UI �
 | **Safe bash only** | `bash-allowlist.ts` matches destructive patterns (`rm`, `mv`, `npm install`, `git commit`, etc.) and blocks them; only read-only commands pass |
 | **Human emits, not the agent** | The PRD only lands on disk when the USER runs `/emit-plan` — the agent never calls a write tool |
 | **Compile conditions gate emission** | `/emit-plan` runs the exact same `validatePlan()` checklist as `/compile-prd`; drafts with errors are bounced back to the planner for correction, nothing is written |
+| **Bounded auto-retry** | the draft-then-emit loop on `agent_end` has a fixed retry budget (`EMIT_ATTEMPTS`) — it can never ping-pong with the planner indefinitely |
 | **Human review always** | `/emit-plan` only writes `tasks/prd-<branch>.md`; `prd.json` is written exclusively by `/compile-prd` after review |
 | **Decision persistence** | Decisions are saved to the session via `pi.appendEntry` and restored on `session_start` / `session_tree`, so resuming a session keeps its grounding |
 

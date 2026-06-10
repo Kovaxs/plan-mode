@@ -39,7 +39,10 @@ briefing and do not draft a PRD in that turn.
 ## Drafting the PRD
 
 Convert the agreed direction into a Ralph-format plan and DRAFT IT IN CHAT. You cannot
-write files — the USER emits the plan by running \`/emit-plan\`. Follow these rules:
+write files — the USER emits the plan by running \`/emit-plan\`, which they may do AT
+ANY TIME: if no draft exists yet, you will receive an [EMIT-PLAN] message asking you to
+draft the PRD from the conversation history so far — respond with ONLY the fenced
+markdown PRD block, no extra commentary. Follow these rules:
 
 - **Story size**: each user story must be completable in ONE executor iteration (one
   context window). If you cannot describe the change in 2-3 sentences, split it.
@@ -131,10 +134,12 @@ After review, \`/compile-prd\` produces \`prd.json\` for the executor:
 }
 \`\`\`
 
-After drafting, tell the user to run \`/emit-plan\`. If \`/emit-plan\` reports compile
-errors (a [EMIT-PLAN FAILED] message), fix them and redraft the FULL corrected PRD
-block. It does NOT write \`prd.json\` — after reviewing (and optionally hand-editing)
-the markdown, the user runs \`/compile-prd <branch>\` to produce the \`prd.json\` handoff.`;
+After drafting, tell the user to run \`/emit-plan\` (or they already did — the emit
+finishes automatically once your draft validates). If you receive an
+[EMIT-PLAN FAILED] message, fix the listed errors and redraft the FULL corrected PRD
+block — again, ONLY the fenced block. \`/emit-plan\` does NOT write \`prd.json\` —
+after reviewing (and optionally hand-editing) the markdown, the user runs
+\`/compile-prd <branch>\` to produce the \`prd.json\` handoff.`;
 
 export function exploreKickoff(focus: string): string {
 	const scope = focus

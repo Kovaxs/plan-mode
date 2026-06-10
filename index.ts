@@ -8,11 +8,13 @@
  * Flow:
  *   pi --plan "add notifications"
  *     -> planner persona, read-only tools
- *     -> /explore   interactive advisory loop (agent helps the USER understand
- *                   options/implications/changes; decisions are recorded)
- *     -> emit_plan  schema + Ralph-checklist validated
- *                   -> writes tasks/prd-<branch>.md  (human review gate, always)
- *                   -> on approval writes ./prd.json (the handoff; ralph.sh consumes it)
+ *     -> /explore     interactive advisory loop (agent helps the USER understand
+ *                     options/implications/changes; decisions are recorded)
+ *     -> agent drafts the PRD as markdown in chat (no file writes)
+ *     -> /emit-plan   USER command: validates the draft against the full
+ *                     Ralph checklist (same conditions as compiling) and
+ *                     writes tasks/prd-<branch>.md (human review gate, always)
+ *     -> /compile-prd USER command: tasks/prd-<branch>.md -> ./prd.json
  *
  * The executor (ralph.sh) is never touched. The only shared contract is prd.json.
  */
@@ -23,19 +25,20 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { isSafeCommand } from "./bash-allowlist.ts";
 import { exploreKickoff, PLANNER_PERSONA } from "./prompts.ts";
-import { type Prd, parsePrdMarkdown, PrdSchema, toPrdJson, validatePlan } from "./schema.ts";
+import {
+	type Decision,
+	extractPrdMarkdown,
+	parsePrdMarkdown,
+	renderPrdMarkdown,
+	toPrdJson,
+	validatePlan,
+} from "./schema.ts";
 
 // Where artifacts land. Adjust to match your ralph.sh location if needed.
 const PRD_JSON_PATH = "prd.json";
 const prdMdPath = (branch: string) => path.join("tasks", `prd-${branch.replace(/^ralph\//, "")}.md`);
 
 const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash"];
-
-interface Decision {
-	question: string;
-	decision: string;
-	rationale?: string;
-}
 
 export default function planMode(pi: ExtensionAPI): void {
 	let planEnabled = false;
@@ -82,6 +85,22 @@ export default function planMode(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Find the most recent drafted PRD in the current session branch. */
+	function findDraftedPrd(ctx: ExtensionContext): string | null {
+		const entries = ctx.sessionManager.getBranch();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const text = entry.message.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			const prd = extractPrdMarkdown(text);
+			if (prd) return prd;
+		}
+		return null;
+	}
+
 	// ── lifecycle: enter planner persona on --plan ──────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
 		if (pi.getFlag("plan") === true) planEnabled = true;
@@ -101,7 +120,10 @@ export default function planMode(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event) => {
 		if (!planEnabled) return;
 		if (event.toolName === "write" || event.toolName === "edit") {
-			return { block: true, reason: "Planner is read-only. Produce a plan with emit_plan instead of editing files." };
+			return {
+				block: true,
+				reason: "Planner is read-only. Draft the PRD as markdown in chat; the user emits it with /emit-plan.",
+			};
 		}
 		if (event.toolName === "bash" && !isSafeCommand(String(event.input.command ?? ""))) {
 			return { block: true, reason: "Planner allows read-only bash only." };
@@ -163,52 +185,56 @@ export default function planMode(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── tool: emit_plan (writes the human-reviewable PRD.md only) ────────────────
-	pi.registerTool({
-		name: "emit_plan",
-		label: "Emit Plan",
-		description:
-			"Emit the final Ralph-format plan as a human-reviewable tasks/prd-<branch>.md. Only call after exploration has recorded decisions. Does NOT write prd.json — the human compiles it with the /compile-prd command after reviewing.",
-		parameters: PrdSchema,
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const plan = params as Prd;
-
+	// ── /emit-plan : USER command — validate drafted PRD, write tasks/prd-<branch>.md ──
+	pi.registerCommand("emit-plan", {
+		description: "Validate the PRD the planner drafted in chat and write tasks/prd-<branch>.md",
+		handler: async (_args, ctx) => {
+			if (!planEnabled) {
+				ctx.ui.notify("/emit-plan is only available in planner mode (pi --plan).", "error");
+				return;
+			}
 			if (decisions.length === 0) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Blocked: no decisions recorded. Run an /explore round and record decisions before emitting a plan.",
-						},
-					],
-					isError: true,
-				};
+				ctx.ui.notify("Blocked: no decisions recorded. Run an /explore round and record decisions first.", "error");
+				return;
 			}
 
+			const draft = findDraftedPrd(ctx);
+			if (!draft) {
+				ctx.ui.notify(
+					"No drafted PRD found in the conversation. Ask the planner to draft the plan (a `# PRD:` markdown block) first.",
+					"error",
+				);
+				return;
+			}
+
+			const plan = parsePrdMarkdown(draft);
+			if (!plan.branchName) {
+				ctx.ui.notify("Drafted PRD has no parseable **Branch:** line. Ask the planner to redraft it.", "error");
+				return;
+			}
+
+			// The plan must meet ALL compiling conditions before it can be emitted.
 			const { errors, warnings } = validatePlan(plan);
 			if (errors.length > 0) {
-				return {
-					content: [{ type: "text", text: `Plan rejected by validation:\n- ${errors.join("\n- ")}` }],
-					isError: true,
-				};
+				ctx.ui.notify(
+					`Plan does not meet compile conditions — not emitted:\n- ${errors.join("\n- ")}\nAsk the planner to fix the draft, then run /emit-plan again.`,
+					"error",
+				);
+				return;
 			}
 
 			// Write the human-readable PRD. The human reviews it, then runs /compile-prd.
 			const mdPath = prdMdPath(plan.branchName);
-			await fs.mkdir(path.dirname(path.resolve(ctx.cwd, mdPath)), { recursive: true });
-			await fs.writeFile(path.resolve(ctx.cwd, mdPath), renderPrdMarkdown(plan, decisions, warnings), "utf8");
+			const absMd = path.resolve(ctx.cwd, mdPath);
+			await fs.mkdir(path.dirname(absMd), { recursive: true });
+			await fs.writeFile(absMd, renderPrdMarkdown(plan, decisions, warnings), "utf8");
 
-			const warnLine = warnings.length ? `\n⚠ ${warnings.length} warning(s) — see ${mdPath}` : "";
 			const branch = plan.branchName.replace(/^ralph\//, "");
-			return {
-				content: [
-					{
-						type: "text",
-						text: `PRD written to ${mdPath}.${warnLine}\nReview it, edit by hand if needed, then run \`/compile-prd ${branch}\` to produce ${PRD_JSON_PATH} for the executor (ralph.sh).`,
-					},
-				],
-				details: { stories: plan.userStories.length, warnings, mdPath },
-			};
+			const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
+			ctx.ui.notify(
+				`PRD written to ${mdPath} (${plan.userStories.length} stories).${warnNote}\nReview it, edit by hand if needed, then run /compile-prd ${branch} to produce ${PRD_JSON_PATH}.`,
+				warnings.length ? "warning" : "info",
+			);
 		},
 	});
 
@@ -274,7 +300,7 @@ export default function planMode(pi: ExtensionAPI): void {
 			const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
 			ctx.ui.notify(
 				`Wrote ${PRD_JSON_PATH} from ${mdPath} (${plan.userStories.length} stories).${warnNote}`,
-				warnings.length ? "warning" : "success",
+				warnings.length ? "warning" : "info",
 			);
 		},
 	});
@@ -284,39 +310,4 @@ export default function planMode(pi: ExtensionAPI): void {
 		restore(ctx);
 		refreshUi(ctx);
 	});
-}
-
-// ── PRD.md renderer (human review artifact) ───────────────────────────────────
-function renderPrdMarkdown(plan: Prd, decisions: Decision[], warnings: string[]): string {
-	const stories = [...plan.userStories]
-		.sort((a, b) => a.priority - b.priority)
-		.map(
-			(s) =>
-				`### ${s.id}: ${s.title}\n**Description:** ${s.description}\n\n**Acceptance Criteria:**\n${s.acceptanceCriteria
-					.map((c) => `- [ ] ${c}`)
-					.join("\n")}\n`,
-		)
-		.join("\n");
-
-	const decisionsMd = decisions.length
-		? decisions.map((d) => `- **${d.question}** → ${d.decision}${d.rationale ? ` _(${d.rationale})_` : ""}`).join("\n")
-		: "_none_";
-
-	const warningsMd = warnings.length ? `\n## ⚠ Validation Warnings\n${warnings.map((w) => `- ${w}`).join("\n")}\n` : "";
-
-	return `# PRD: ${plan.project}
-
-**Branch:** \`${plan.branchName}\`
-
-${plan.description}
-
-## Decisions from Exploration
-${decisionsMd}
-
-## User Stories
-${stories}
-${warningsMd}
----
-_Review this document. Approving in pi writes \`${PRD_JSON_PATH}\` for the executor._
-`;
 }

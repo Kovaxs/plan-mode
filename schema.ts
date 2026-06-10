@@ -1,34 +1,39 @@
 /**
- * prd.json schema + validation.
+ * prd.json contract + validation + markdown round-trip.
  *
- * This is the handoff contract consumed by Ralph (ralph.sh). The planner
- * never hand-writes this JSON — it calls the `emit_plan` tool, whose params
- * are validated against this schema PLUS Ralph's story-quality checklist.
+ * This is the handoff contract consumed by Ralph (ralph.sh). The planner agent
+ * never writes files — it drafts the PRD as markdown in chat; the HUMAN runs
+ * `/emit-plan`, which validates against Ralph's story-quality checklist (the
+ * same conditions `/compile-prd` enforces) and writes `tasks/prd-<branch>.md`.
+ *
+ * This module is dependency-free on purpose so it can be unit-tested directly
+ * with `node --test`.
  */
 
-import { Type, type Static } from "typebox";
+export interface UserStory {
+	/** Sequential id, e.g. US-001 */
+	id: string;
+	/** Short descriptive name */
+	title: string;
+	/** As a [user], I want [feature] so that [benefit] */
+	description: string;
+	/** Verifiable checklist. Must include 'Typecheck passes'. UI stories must include browser verification. */
+	acceptanceCriteria: string[];
+	/** 1-based. Dependency order: schema -> backend -> UI. */
+	priority: number;
+	/** Always false on emit (executor flips it). */
+	passes: boolean;
+	/** Empty on emit. */
+	notes: string;
+}
 
-export const UserStorySchema = Type.Object({
-	id: Type.String({ description: "Sequential id, e.g. US-001" }),
-	title: Type.String({ description: "Short descriptive name" }),
-	description: Type.String({ description: "As a [user], I want [feature] so that [benefit]" }),
-	acceptanceCriteria: Type.Array(Type.String(), {
-		description: "Verifiable checklist. Must include 'Typecheck passes'. UI stories must include browser verification.",
-	}),
-	priority: Type.Number({ description: "1-based. Dependency order: schema -> backend -> UI." }),
-	passes: Type.Boolean({ description: "Always false on emit (executor flips it)." }),
-	notes: Type.String({ description: "Empty on emit." }),
-});
-
-export const PrdSchema = Type.Object({
-	project: Type.String(),
-	branchName: Type.String({ description: "kebab-case, prefixed with 'ralph/'" }),
-	description: Type.String(),
-	userStories: Type.Array(UserStorySchema),
-});
-
-export type UserStory = Static<typeof UserStorySchema>;
-export type Prd = Static<typeof PrdSchema>;
+export interface Prd {
+	project: string;
+	/** kebab-case, prefixed with 'ralph/' */
+	branchName: string;
+	description: string;
+	userStories: UserStory[];
+}
 
 export interface ValidationResult {
 	errors: string[];
@@ -41,7 +46,7 @@ const BROWSER_VERIFY = /verify in browser|dev-browser/i;
 
 /**
  * Run Ralph's story-quality checklist over a plan.
- * Errors block emission; warnings are surfaced but allowed.
+ * Errors block emission/compilation; warnings are surfaced but allowed.
  */
 export function validatePlan(plan: Prd): ValidationResult {
 	const errors: string[] = [];
@@ -102,11 +107,69 @@ export function toPrdJson(plan: Prd): string {
 	return `${JSON.stringify({ ...plan, userStories: ordered }, null, 2)}\n`;
 }
 
+export interface Decision {
+	question: string;
+	decision: string;
+	rationale?: string;
+}
+
+/** Render the human-review PRD markdown (`tasks/prd-<branch>.md`). */
+export function renderPrdMarkdown(plan: Prd, decisions: Decision[], warnings: string[]): string {
+	const stories = [...plan.userStories]
+		.sort((a, b) => a.priority - b.priority)
+		.map(
+			(s) =>
+				`### ${s.id}: ${s.title}\n**Description:** ${s.description}\n\n**Acceptance Criteria:**\n${s.acceptanceCriteria
+					.map((c) => `- [ ] ${c}`)
+					.join("\n")}\n`,
+		)
+		.join("\n");
+
+	const decisionsMd = decisions.length
+		? decisions.map((d) => `- **${d.question}** → ${d.decision}${d.rationale ? ` _(${d.rationale})_` : ""}`).join("\n")
+		: "_none_";
+
+	const warningsMd = warnings.length ? `\n## ⚠ Validation Warnings\n${warnings.map((w) => `- ${w}`).join("\n")}\n` : "";
+
+	return `# PRD: ${plan.project}
+
+**Branch:** \`${plan.branchName}\`
+
+${plan.description}
+
+## Decisions from Exploration
+${decisionsMd}
+
+## User Stories
+${stories}
+${warningsMd}
+---
+_Review this document, edit by hand if needed, then run \`/compile-prd\` to produce \`prd.json\` for the executor._
+`;
+}
+
 /**
- * Parse a human-reviewed `tasks/prd-<branch>.md` back into a Prd.
+ * Extract a drafted PRD (markdown) from an assistant chat message.
  *
- * This is the inverse of `renderPrdMarkdown` in index.ts. The markdown does not
- * carry priority / passes / notes, so we reconstruct them: priority follows the
+ * The planner persona drafts the plan inside a fenced \`\`\`markdown block whose
+ * body starts with `# PRD:`. Falls back to an unfenced `# PRD:` heading.
+ * Returns null when the text contains no PRD.
+ */
+export function extractPrdMarkdown(text: string): string | null {
+	const fences = [...text.matchAll(/```(?:markdown|md)?[ \t]*\n([\s\S]*?)```/g)];
+	for (let i = fences.length - 1; i >= 0; i--) {
+		const body = fences[i][1];
+		if (/^#\s+PRD:/m.test(body)) return body.trim();
+	}
+	const match = text.match(/^#\s+PRD:[\s\S]*/m);
+	return match ? match[0].trim() : null;
+}
+
+/**
+ * Parse a PRD markdown document (drafted in chat or reviewed on disk) into a Prd.
+ *
+ * This is the inverse of `renderPrdMarkdown`. The markdown does not carry
+ * priority / passes / notes, so we reconstruct them: priority follows the
  * (dependency-ordered) document order, passes is always false, notes is empty.
  */
 export function parsePrdMarkdown(md: string): Prd {

@@ -11,7 +11,7 @@ pi --plan                                    # enter planner, then just chat
 pi --plan "add a notifications system"       # optional: seed the first turn
 ```
 
-From there you describe your feature, the agent explores and helps you make decisions, and when you're ready it emits a human-reviewable PRD. You review it, then compile it into the executor handoff.
+From there you describe your feature, the agent explores and helps you make decisions, then drafts a PRD in chat. You emit it with `/emit-plan` (validated against the full compile checklist), review the markdown, then compile it into the executor handoff with `/compile-prd`.
 
 ---
 
@@ -19,10 +19,47 @@ From there you describe your feature, the agent explores and helps you make deci
 
 | File | Role |
 |------|------|
-| `index.ts` | Extension entry: `--plan` flag, persona injection, tool/command gating, `/explore`, `/decisions`, `/compile-prd`, `record_decision` tool, `emit_plan` tool, UI status, decision persistence |
-| `prompts.ts` | `PLANNER_PERSONA` system prompt (two-phase workflow), `exploreKickoff()` message generator |
-| `schema.ts` | TypeBox `PrdSchema`, Ralph-checklist `validatePlan()`, `toPrdJson()`, `parsePrdMarkdown()` (markdown → Prd for compiling) |
+| `index.ts` | Extension entry: `--plan` flag, persona injection, tool/command gating, `/explore`, `/decisions`, `/emit-plan`, `/compile-prd`, `record_decision` tool, UI status, decision persistence |
+| `prompts.ts` | `PLANNER_PERSONA` system prompt (two-phase workflow: explore → draft), `exploreKickoff()` message generator |
+| `schema.ts` | **Dependency-free** PRD contract: types (`Prd`, `UserStory`, `Decision`), `validatePlan()` (Ralph checklist), `extractPrdMarkdown()` (chat draft → markdown), `parsePrdMarkdown()` (markdown → Prd), `renderPrdMarkdown()` (Prd → `tasks/prd-<branch>.md`), `toPrdJson()` (Prd → `prd.json`) |
+| `schema.test.ts` | 8 unit tests covering the full `/emit-plan` pipeline |
 | `bash-allowlist.ts` | `isSafeCommand()` — blocks destructive bash patterns, allows read-only commands only |
+
+### Data flow
+
+```
+User describes feature
+        │
+        ▼
+  ┌─ /explore ─┐  read-only codebase investigation
+  │  briefing   │  → Interpretation, Options, Implications, Impact, Decisions
+  │  decisions  │  → user commits → record_decision tool
+  └─────────────┘
+        │
+        ▼
+  Agent drafts PRD as fenced ```markdown block in chat (cannot write files)
+        │
+        ▼
+  ┌─ /emit-plan ─┐  USER command (not the agent)
+  │  find draft   │  → scans assistant messages for # PRD: block
+  │  parse +      │  → parsePrdMarkdown() → Prd
+  │  validate     │  → validatePlan() — must pass ALL compile conditions
+  │  write        │  → tasks/prd-<branch>.md  (human review gate)
+  └───────────────┘
+        │
+        ▼
+  User reviews (and optionally hand-edits) tasks/prd-<branch>.md
+        │
+        ▼
+  ┌─ /compile-prd ─┐  USER command
+  │  re-parse       │  → tasks/prd-<branch>.md → Prd
+  │  re-validate    │  → validatePlan() (same checklist, always passes)
+  │  write          │  → prd.json  (Ralph handoff)
+  └─────────────────┘
+        │
+        ▼
+  ralph.sh reads prd.json, executes stories, flips passes: true
+```
 
 ---
 
@@ -47,19 +84,45 @@ When you enter planner mode, the agent adopts a read-only persona. Its job is to
 
 This is an **interactive loop** — keep exploring until you're confident before moving to planning.
 
-### Phase 2 — Plan (emit the PRD)
+### Phase 2 — Draft the PRD
 
-Once decisions are recorded, the agent converts the agreed direction into a Ralph-format plan and calls `emit_plan`.
+Once decisions are recorded, you ask the agent to draft the plan. The agent converts the agreed direction into a Ralph-format PRD and presents it as a **fenced `` ```markdown `` code block** in chat. It follows an exact template:
 
-**`emit_plan`** writes only `tasks/prd-<branch>.md` — a human-readable markdown document for review. It does **not** write `prd.json` directly.
+~~~markdown
+```markdown
+# PRD: <project name>
 
-The markdown document includes:
-- Project name, branch name, description
-- All recorded exploration decisions
-- Ordered user stories with acceptance criteria
-- Validation warnings (if any)
+**Branch:** `ralph/<kebab-case-branch>`
 
-### Phase 3 — Review & compile
+<one-paragraph description>
+
+## User Stories
+
+### US-001: <title>
+**Description:** As a <user>, I want <feature> so that <benefit>
+
+**Acceptance Criteria:**
+- [ ] <verifiable criterion>
+- [ ] Typecheck passes
+```
+~~~
+
+Story order = priority order. Every story must include "Typecheck passes". UI stories must include "Verify in browser using dev-browser skill". The planner is read-only — **it cannot write files**.
+
+### Phase 3 — Emit the PRD (user command)
+
+Emitting is an **explicit user command**, not something the agent does:
+
+**`/emit-plan`** —
+
+1. Scans the conversation for the most recent assistant message containing a `# PRD:` markdown block.
+2. Parses it into a structured `Prd` via `parsePrdMarkdown()`.
+3. Runs `validatePlan()` — the **exact same Ralph checklist that `/compile-prd` enforces**. If any compile condition fails (missing `ralph/` prefix, no stories, duplicate IDs, missing "Typecheck passes", `passes !== false`, etc.), the plan is **rejected** with the full error list. Nothing is written.
+4. On success, renders and writes `tasks/prd-<branch>.md` — a normalized markdown document including project metadata, recorded exploration decisions, ordered user stories, and any validation warnings.
+
+If the user wants changes, they ask the agent to revise the draft, then run `/emit-plan` again.
+
+### Phase 4 — Review & compile
 
 1. **Review** `tasks/prd-<branch>.md`. Edit by hand if needed.
 2. **`/compile-prd`** — compile the reviewed markdown into `prd.json`:
@@ -73,10 +136,10 @@ The command re-parses the markdown, re-runs schema + Ralph-checklist validation,
 
 ## Output artifacts
 
-| File | Purpose |
-|------|---------|
-| `tasks/prd-<branch>.md` | Human-readable PRD — the review gate |
-| `prd.json` | Machine handoff consumed by `ralph.sh` |
+| File | Produced by | Purpose |
+|------|-------------|---------|
+| `tasks/prd-<branch>.md` | `/emit-plan` | Human-readable PRD — the review gate |
+| `prd.json` | `/compile-prd` | Machine handoff consumed by `ralph.sh` |
 
 Adjust `PRD_JSON_PATH` / `prdMdPath` in `index.ts` if your Ralph setup expects the JSON elsewhere.
 
@@ -84,7 +147,7 @@ Adjust `PRD_JSON_PATH` / `prdMdPath` in `index.ts` if your Ralph setup expects t
 
 ## User story validation rules
 
-The `validatePlan()` function in `schema.ts` enforces Ralph's story-quality checklist on every `emit_plan` and `/compile-prd`:
+The `validatePlan()` function in `schema.ts` enforces Ralph's story-quality checklist on every `/emit-plan` and `/compile-prd` — a plan that cannot compile cannot be emitted:
 
 ### Blocking errors (reject the plan)
 
@@ -112,11 +175,12 @@ Priority follows dependency order: schema/migrations → backend logic → UI �
 
 | Guardrail | Mechanism |
 |-----------|-----------|
-| **Read-only** | `write` and `edit` tools are blocked in planner mode |
+| **Read-only** | `write` and `edit` tools are blocked in planner mode — the agent can only draft the PRD in chat |
 | **Safe bash only** | `bash-allowlist.ts` matches destructive patterns (`rm`, `mv`, `npm install`, `git commit`, etc.) and blocks them; only read-only commands pass |
-| **Exploration required** | `emit_plan` is blocked until at least one decision is recorded via `record_decision` |
-| **Human review always** | `emit_plan` only writes `tasks/prd-<branch>.md`; `prd.json` is written exclusively by `/compile-prd` after review |
-| **Schema validation** | Every plan is validated against `PrdSchema` (TypeBox) + Ralph-checklist on both emit and compile |
+| **Human emits, not the agent** | The PRD only lands on disk when the USER runs `/emit-plan` — the agent never calls a write tool |
+| **Exploration required** | `/emit-plan` is blocked until at least one decision is recorded via `record_decision` |
+| **Compile conditions gate emission** | `/emit-plan` runs the exact same `validatePlan()` checklist as `/compile-prd`; drafts with errors are rejected |
+| **Human review always** | `/emit-plan` only writes `tasks/prd-<branch>.md`; `prd.json` is written exclusively by `/compile-prd` after review |
 | **Decision persistence** | Decisions are saved to the session via `pi.appendEntry` and restored on `session_start` / `session_tree`, so resuming a session keeps its grounding |
 
 ---
@@ -140,6 +204,29 @@ When planner mode is active, the extension provides:
 ## `/explore` vs Ralph's clarifying questions
 
 Unlike Ralph's PRD clarifying questions (which *extract intent from the user*), `/explore` flows the other way: the agent **builds the user's understanding** of their own request. It's an interactive advisory loop — the agent investigates the codebase and helps you see options, implications, and decisions you may not have considered.
+
+---
+
+## Tests
+
+`schema.ts` is **dependency-free** (no TypeBox, no pi imports), so the entire emit pipeline is unit-testable directly with Node's built-in test runner:
+
+```bash
+node --test schema.test.ts
+```
+
+**8 tests, all passing:**
+
+| Test | What it covers |
+|------|----------------|
+| `extractPrdMarkdown` — fenced block | Pulls the PRD out of a ` ```markdown ` fenced chat draft |
+| `extractPrdMarkdown` — unfenced fallback | Falls back to an unfenced `# PRD:` heading |
+| `extractPrdMarkdown` — no PRD | Returns `null` when no PRD is present in the text |
+| `parsePrdMarkdown` round-trip | Reconstructs the full Ralph contract (ids, priorities, criteria) |
+| Valid draft → no errors | A well-formed draft meets all compile conditions |
+| Compile conditions fail | Catches: missing Typecheck, bad branch prefix, no stories, duplicate IDs |
+| Full pipeline | chat draft → extract → parse → validate → render `tasks/prd-<branch>.md` → re-parse → `prd.json` matching Ralph's contract |
+| Priority ordering | `toPrdJson()` sorts stories by priority regardless of input order |
 
 ---
 

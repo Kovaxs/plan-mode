@@ -107,10 +107,200 @@ export default function planMode(pi: ExtensionAPI): void {
 		return null;
 	}
 
+	// ── deferred registration: tools + commands only in --plan sessions ─────────
+	// pi.getFlag() returns the CLI default at factory time; real values are only
+	// available after session_start. Registering here keeps tools and commands
+	// completely invisible in non- --plan sessions.
+	function registerPlanCapabilities(): void {
+		// ── /explore : OPTIONAL interactive advisory loop ───────────────────────
+		pi.registerCommand("explore", {
+			description: "Optional: explore the request in depth — options, implications, impact (read-only)",
+			handler: async (args, ctx) => {
+				if (!planEnabled) {
+					ctx.ui.notify("Explore is only available in planner mode (pi --plan).", "error");
+					return;
+				}
+				pi.sendUserMessage(exploreKickoff(args.trim()));
+			},
+		});
+
+		// ── /decisions : show recorded decisions ────────────────────────────────
+		pi.registerCommand("decisions", {
+			description: "Show decisions recorded during exploration",
+			handler: async (_args, ctx) => {
+				if (decisions.length === 0) {
+					ctx.ui.notify("No decisions recorded yet. They are recorded automatically as you resolve questions in chat.", "info");
+					return;
+				}
+				const list = decisions
+					.map((d, i) => `${i + 1}. ${d.question}\n   → ${d.decision}${d.rationale ? `\n     (${d.rationale})` : ""}`)
+					.join("\n");
+				ctx.ui.notify(`Recorded decisions:\n${list}`, "info");
+			},
+		});
+
+		// ── tool: ask_decision (interactive picker — presents options, records pick) ─
+		pi.registerTool({
+			name: "ask_decision",
+			label: "Ask Decision",
+			description:
+				"Present a decision point to the user as an interactive picker. The user's choice is recorded as a decision automatically. Use this whenever the user must choose between concrete options.",
+			parameters: Type.Object({
+				question: Type.String({ description: "The decision point / question being resolved" }),
+				options: Type.Array(Type.String(), {
+					description: "2-5 concrete options the user can pick from (a free-text 'Other' is added automatically)",
+				}),
+			}),
+			async execute(_id, params, _signal, _onUpdate, ctx) {
+				if (!ctx.hasUI) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "No interactive UI available. Ask the question in chat instead, then record the answer with record_decision.",
+							},
+						],
+					};
+				}
+				const OTHER = "✎ Other (type an answer)";
+				const choice = await ctx.ui.select(params.question, [...params.options, OTHER]);
+				if (choice === undefined) {
+					return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
+				}
+				let answer = choice;
+				if (choice === OTHER) {
+					const typed = await ctx.ui.input(params.question, "your answer");
+					if (!typed?.trim()) {
+						return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
+					}
+					answer = typed.trim();
+				}
+				decisions.push({ question: params.question, decision: answer });
+				persist();
+				refreshUi(ctx);
+				return {
+					content: [{ type: "text", text: `User decided: ${params.question} → ${answer} (recorded)` }],
+					details: { decisionCount: decisions.length },
+				};
+			},
+		});
+
+		// ── tool: record_decision (free-form commitments made in chat) ──────────────
+		pi.registerTool({
+			name: "record_decision",
+			label: "Record Decision",
+			description:
+				"Record a decision the user committed to in chat. Call this immediately whenever the user resolves an option, scope, or direction question — on every interaction where a decision is made.",
+			parameters: Type.Object({
+				question: Type.String({ description: "The decision point / question being resolved" }),
+				decision: Type.String({ description: "What the user decided" }),
+				rationale: Type.Optional(Type.String({ description: "Why (optional)" })),
+			}),
+			async execute(_id, params, _signal, _onUpdate, ctx) {
+				decisions.push({ question: params.question, decision: params.decision, rationale: params.rationale });
+				persist();
+				refreshUi(ctx);
+				return {
+					content: [{ type: "text", text: `Recorded decision: ${params.question} → ${params.decision}` }],
+					details: { decisionCount: decisions.length },
+				};
+			},
+		});
+
+		// ── /emit-plan : generate the PRD from the chat history → tasks/prd-<branch>.md ─
+		pi.registerCommand("emit-plan", {
+			description: "Generate the PRD from the chat (drafting it if needed), validate, and write tasks/prd-<branch>.md",
+			handler: async (_args, ctx) => {
+				if (!planEnabled) {
+					ctx.ui.notify("/emit-plan is only available in planner mode (pi --plan).", "error");
+					return;
+				}
+				const result = await tryEmitPlan(ctx);
+				if (result === "no-draft") {
+					pendingEmit = EMIT_ATTEMPTS;
+					ctx.ui.notify("No PRD draft in chat yet — asking the planner to generate one from the conversation…", "info");
+					pi.sendUserMessage(draftRequest());
+				} else if (result === "bounced") {
+					pendingEmit = 1; // auto-finish once the planner posts the corrected draft
+				} else {
+					pendingEmit = 0;
+				}
+			},
+		});
+
+		// ── /compile-prd : transform tasks/prd-<branch>.md → prd.json ────────────────
+		pi.registerCommand("compile-prd", {
+			description: "Compile a reviewed tasks/prd-<branch>.md into prd.json for the executor",
+			handler: async (args, ctx) => {
+				const arg = args.trim();
+				let mdPath: string;
+
+				if (arg) {
+					// Accept a branch name, a bare prd-*.md filename, or a path.
+					mdPath = arg.includes("/") || arg.endsWith(".md") ? arg : prdMdPath(arg);
+				} else {
+					const tasksDir = path.resolve(ctx.cwd, "tasks");
+					const found = await fs
+						.readdir(tasksDir)
+						.then((files) => files.filter((f) => /^prd-.+\.md$/.test(f)))
+						.catch(() => [] as string[]);
+					if (found.length === 0) {
+						ctx.ui.notify("No tasks/prd-*.md files found. Emit or write a PRD first.", "error");
+						return;
+					}
+					const picked = found.length === 1 ? found[0] : await ctx.ui.select("Which PRD do you want to compile?", found);
+					if (!picked) return;
+					mdPath = path.join("tasks", picked);
+				}
+
+				const absMd = path.resolve(ctx.cwd, mdPath);
+				let md: string;
+				try {
+					md = await fs.readFile(absMd, "utf8");
+				} catch {
+					ctx.ui.notify(`Could not read ${mdPath}.`, "error");
+					return;
+				}
+
+				const plan = parsePrdMarkdown(md);
+				if (!plan.branchName) {
+					ctx.ui.notify(`Could not parse a branch name from ${mdPath}. Is it a valid PRD?`, "error");
+					return;
+				}
+
+				const { errors, warnings } = validatePlan(plan);
+				if (errors.length > 0) {
+					ctx.ui.notify(`Plan rejected by validation:\n- ${errors.join("\n- ")}`, "error");
+					return;
+				}
+
+				if (ctx.hasUI) {
+					const warnLine = warnings.length ? ` (${warnings.length} warning(s))` : "";
+					const choice = await ctx.ui.select(
+						`Compile ${mdPath} → ${PRD_JSON_PATH}? ${plan.userStories.length} story(ies)${warnLine}`,
+						["✓ Write prd.json", "✗ Cancel"],
+					);
+					if (!choice?.startsWith("✓")) {
+						ctx.ui.notify("Cancelled. prd.json not written.", "info");
+						return;
+					}
+				}
+
+				await fs.writeFile(path.resolve(ctx.cwd, PRD_JSON_PATH), toPrdJson(plan), "utf8");
+				const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
+				ctx.ui.notify(
+					`Wrote ${PRD_JSON_PATH} from ${mdPath} (${plan.userStories.length} stories).${warnNote}`,
+					warnings.length ? "warning" : "info",
+				);
+			},
+		});
+	}
+
 	// ── lifecycle: enter planner persona on --plan ──────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
 		if (pi.getFlag("plan") === true) planEnabled = true;
 		if (!planEnabled) return;
+		registerPlanCapabilities();
 		restore(ctx);
 		pi.setActiveTools(PLAN_TOOLS);
 		refreshUi(ctx);
@@ -142,102 +332,7 @@ export default function planMode(pi: ExtensionAPI): void {
 		return { systemPrompt: `${event.systemPrompt}\n\n${PLANNER_PERSONA}` };
 	});
 
-	// ── /explore : OPTIONAL interactive advisory loop ───────────────────────────
-	pi.registerCommand("explore", {
-		description: "Optional: explore the request in depth — options, implications, impact (read-only)",
-		handler: async (args, ctx) => {
-			if (!planEnabled) {
-				ctx.ui.notify("Explore is only available in planner mode (pi --plan).", "error");
-				return;
-			}
-			pi.sendUserMessage(exploreKickoff(args.trim()));
-		},
-	});
-
-	// ── /decisions : show recorded decisions ────────────────────────────────────
-	pi.registerCommand("decisions", {
-		description: "Show decisions recorded during exploration",
-		handler: async (_args, ctx) => {
-			if (decisions.length === 0) {
-				ctx.ui.notify("No decisions recorded yet. They are recorded automatically as you resolve questions in chat.", "info");
-				return;
-			}
-			const list = decisions
-				.map((d, i) => `${i + 1}. ${d.question}\n   → ${d.decision}${d.rationale ? `\n     (${d.rationale})` : ""}`)
-				.join("\n");
-			ctx.ui.notify(`Recorded decisions:\n${list}`, "info");
-		},
-	});
-
-	// ── tool: ask_decision (interactive picker — presents options, records pick) ─
-	pi.registerTool({
-		name: "ask_decision",
-		label: "Ask Decision",
-		description:
-			"Present a decision point to the user as an interactive picker. The user's choice is recorded as a decision automatically. Use this whenever the user must choose between concrete options.",
-		parameters: Type.Object({
-			question: Type.String({ description: "The decision point / question being resolved" }),
-			options: Type.Array(Type.String(), {
-				description: "2-5 concrete options the user can pick from (a free-text 'Other' is added automatically)",
-			}),
-		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			if (!ctx.hasUI) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "No interactive UI available. Ask the question in chat instead, then record the answer with record_decision.",
-						},
-					],
-				};
-			}
-			const OTHER = "✎ Other (type an answer)";
-			const choice = await ctx.ui.select(params.question, [...params.options, OTHER]);
-			if (choice === undefined) {
-				return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
-			}
-			let answer = choice;
-			if (choice === OTHER) {
-				const typed = await ctx.ui.input(params.question, "your answer");
-				if (!typed?.trim()) {
-					return { content: [{ type: "text", text: "User cancelled — no decision recorded." }] };
-				}
-				answer = typed.trim();
-			}
-			decisions.push({ question: params.question, decision: answer });
-			persist();
-			refreshUi(ctx);
-			return {
-				content: [{ type: "text", text: `User decided: ${params.question} → ${answer} (recorded)` }],
-				details: { decisionCount: decisions.length },
-			};
-		},
-	});
-
-	// ── tool: record_decision (free-form commitments made in chat) ──────────────
-	pi.registerTool({
-		name: "record_decision",
-		label: "Record Decision",
-		description:
-			"Record a decision the user committed to in chat. Call this immediately whenever the user resolves an option, scope, or direction question — on every interaction where a decision is made.",
-		parameters: Type.Object({
-			question: Type.String({ description: "The decision point / question being resolved" }),
-			decision: Type.String({ description: "What the user decided" }),
-			rationale: Type.Optional(Type.String({ description: "Why (optional)" })),
-		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			decisions.push({ question: params.question, decision: params.decision, rationale: params.rationale });
-			persist();
-			refreshUi(ctx);
-			return {
-				content: [{ type: "text", text: `Recorded decision: ${params.question} → ${params.decision}` }],
-				details: { decisionCount: decisions.length },
-			};
-		},
-	});
-
-	// ── /emit-plan : generate the PRD from the chat history → tasks/prd-<branch>.md ─
+	// ── /emit-plan infrastructure (used by command + agent_end handler) ───────────
 	// A pre-existing draft is NOT required: if none is found, the planner is asked
 	// to draft one from the conversation, and the emit auto-finishes on agent_end.
 	const EMIT_ATTEMPTS = 2; // auto-retries after asking the planner to draft/fix
@@ -287,26 +382,6 @@ export default function planMode(pi: ExtensionAPI): void {
 		return "written";
 	}
 
-	pi.registerCommand("emit-plan", {
-		description: "Generate the PRD from the chat (drafting it if needed), validate, and write tasks/prd-<branch>.md",
-		handler: async (_args, ctx) => {
-			if (!planEnabled) {
-				ctx.ui.notify("/emit-plan is only available in planner mode (pi --plan).", "error");
-				return;
-			}
-			const result = await tryEmitPlan(ctx);
-			if (result === "no-draft") {
-				pendingEmit = EMIT_ATTEMPTS;
-				ctx.ui.notify("No PRD draft in chat yet — asking the planner to generate one from the conversation…", "info");
-				pi.sendUserMessage(draftRequest());
-			} else if (result === "bounced") {
-				pendingEmit = 1; // auto-finish once the planner posts the corrected draft
-			} else {
-				pendingEmit = 0;
-			}
-		},
-	});
-
 	// Auto-finish a pending /emit-plan once the planner responds.
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!planEnabled || pendingEmit <= 0) return;
@@ -331,73 +406,6 @@ export default function planMode(pi: ExtensionAPI): void {
 		if (pendingEmit <= 0) {
 			ctx.ui.notify("Auto-retry limit reached. When the planner posts the corrected draft, run /emit-plan again.", "warning");
 		}
-	});
-
-	// ── /compile-prd : transform tasks/prd-<branch>.md → prd.json ────────────────
-	pi.registerCommand("compile-prd", {
-		description: "Compile a reviewed tasks/prd-<branch>.md into prd.json for the executor",
-		handler: async (args, ctx) => {
-			const arg = args.trim();
-			let mdPath: string;
-
-			if (arg) {
-				// Accept a branch name, a bare prd-*.md filename, or a path.
-				mdPath = arg.includes("/") || arg.endsWith(".md") ? arg : prdMdPath(arg);
-			} else {
-				const tasksDir = path.resolve(ctx.cwd, "tasks");
-				const found = await fs
-					.readdir(tasksDir)
-					.then((files) => files.filter((f) => /^prd-.+\.md$/.test(f)))
-					.catch(() => [] as string[]);
-				if (found.length === 0) {
-					ctx.ui.notify("No tasks/prd-*.md files found. Emit or write a PRD first.", "error");
-					return;
-				}
-				const picked = found.length === 1 ? found[0] : await ctx.ui.select("Which PRD do you want to compile?", found);
-				if (!picked) return;
-				mdPath = path.join("tasks", picked);
-			}
-
-			const absMd = path.resolve(ctx.cwd, mdPath);
-			let md: string;
-			try {
-				md = await fs.readFile(absMd, "utf8");
-			} catch {
-				ctx.ui.notify(`Could not read ${mdPath}.`, "error");
-				return;
-			}
-
-			const plan = parsePrdMarkdown(md);
-			if (!plan.branchName) {
-				ctx.ui.notify(`Could not parse a branch name from ${mdPath}. Is it a valid PRD?`, "error");
-				return;
-			}
-
-			const { errors, warnings } = validatePlan(plan);
-			if (errors.length > 0) {
-				ctx.ui.notify(`Plan rejected by validation:\n- ${errors.join("\n- ")}`, "error");
-				return;
-			}
-
-			if (ctx.hasUI) {
-				const warnLine = warnings.length ? ` (${warnings.length} warning(s))` : "";
-				const choice = await ctx.ui.select(
-					`Compile ${mdPath} → ${PRD_JSON_PATH}? ${plan.userStories.length} story(ies)${warnLine}`,
-					["✓ Write prd.json", "✗ Cancel"],
-				);
-				if (!choice?.startsWith("✓")) {
-					ctx.ui.notify("Cancelled. prd.json not written.", "info");
-					return;
-				}
-			}
-
-			await fs.writeFile(path.resolve(ctx.cwd, PRD_JSON_PATH), toPrdJson(plan), "utf8");
-			const warnNote = warnings.length ? `\n⚠ ${warnings.map((w) => `- ${w}`).join("\n")}` : "";
-			ctx.ui.notify(
-				`Wrote ${PRD_JSON_PATH} from ${mdPath} (${plan.userStories.length} stories).${warnNote}`,
-				warnings.length ? "warning" : "info",
-			);
-		},
 	});
 
 	// keep decisions correct when navigating the session tree
